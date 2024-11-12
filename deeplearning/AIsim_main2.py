@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 import tensorflow as tf
 from datetime import datetime
 
+
 from deepMIMO5 import (
     get_deepMIMOdata,
     DeepMIMODataset,
@@ -61,6 +62,7 @@ from ldpc.encoding import LDPC5GEncoder
 from ldpc.decoding import LDPC5GDecoder
 
 import os
+from Neural_receiver_v1 import process_signal
 
 IMG_FORMAT = ".pdf"  # ".png"
 
@@ -997,7 +999,9 @@ class Transmitter:
             )
             # DeepMIMO_dataset = get_deepMIMOdata(scenario=scenario, dataset_folder=dataset_folder, num_ue_antenna=self.num_ut_ant, num_bs_antenna=self.num_bs_ant, showfig=self.showfig)
         DeepMIMO_dataset = get_deepMIMOdata(
-            scenario=self.scenario, dataset_folder=self.dataset_folder, showfig=self.showfig
+            scenario=self.scenario,
+            dataset_folder=self.dataset_folder,
+            showfig=self.showfig,
         )
         # The number of UE locations in the generated DeepMIMO dataset
         num_ue_locations = len(DeepMIMO_dataset[0]["user"]["channel"])  # 18100
@@ -1934,9 +1938,8 @@ class Transmitter:
         else:
             return b_hat, None
 
-    def __call__(
-        self, b=None, ebno_db=15.0, perfect_csi=False, datapath="data/saved_data.npy"
-    ):
+    def gettransmitSignal(self, b, ebno_db=15.0, perfect_csi=False):
+        # Part 1: Transmission
         # Compute the noise power for a given Eb/No value. This takes not only the coderate but also the overheads related pilot transmissions and nulled carriers
         no = ebnodb2no(ebno_db, self.num_bits_per_symbol, self.coderate)
         # Convert it to a NumPy float
@@ -1955,6 +1958,47 @@ class Transmitter:
             )  # (64, 1, 16, 1, 2, 1174, 27)
 
         # Transmitter
+        # This calls the uplinktransmission method, which simulates the transmission of data. It takes the input bits b, the noise power no, and the channel response h_out. The method returns:
+        # y: The received signal after transmission.
+        # x_rg: The resource grid used for transmission.
+        # x: The transmitted signal.
+        # b: The original bits.
+        y, x_rg, x, b = self.uplinktransmission(
+            b=b, no=no, h_out=h_out
+        )  # y = self.applychannel([x_rg, h_out, no])
+        print(
+            "y shape:", y.shape
+        )  # (64, 1, 16, 14, 76) [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size]
+        return y, x_rg, x, b, no, h_b, tau_b, h_out
+
+    def __call__(
+        self, b=None, ebno_db=15.0, perfect_csi=False, datapath="data/saved_data.npy"
+    ):
+
+        # Part 1: Transmission
+        # Compute the noise power for a given Eb/No value. This takes not only the coderate but also the overheads related pilot transmissions and nulled carriers
+        no = ebnodb2no(ebno_db, self.num_bits_per_symbol, self.coderate)
+        # Convert it to a NumPy float
+        no = np.float32(no)  # 0.0158
+
+        # we generate random batches of CIR, transform them in the frequency domain and apply them to the resource grid in the frequency domain.
+        h_b, tau_b = (
+            self.get_channelcir()
+        )  # h_b: (128, 1, 16, 1, 2, 23, 14), tau_b: (128, 1, 1, 23)
+        if self.channeltype == "ofdm":
+            h_out = self.get_OFDMchannelresponse(h_b, tau_b)  # cir_to_ofdm_channel
+            print("h_freq shape:", h_out.shape)  # (128, 1, 16, 1, 2, 14, 76)
+        elif self.channeltype == "time":
+            h_out = self.get_timechannelresponse(
+                h_b, tau_b
+            )  # (64, 1, 16, 1, 2, 1174, 27)
+
+        # Transmitter
+        # This calls the uplinktransmission method, which simulates the transmission of data. It takes the input bits b, the noise power no, and the channel response h_out. The method returns:
+        # y: The received signal after transmission.
+        # x_rg: The resource grid used for transmission.
+        # x: The transmitted signal.
+        # b: The original bits.
         y, x_rg, x, b = self.uplinktransmission(
             b=b, no=no, h_out=h_out
         )  # y = self.applychannel([x_rg, h_out, no])
@@ -1962,38 +2006,56 @@ class Transmitter:
             "y shape:", y.shape
         )  # (64, 1, 16, 14, 76) [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size]
 
+        # Transmission part is done,
+        # Receiver part starts
         # Option1:
         # b_hat, BER = self.receiver(y, no, x_rg, b=b, h_b=h_b, tau_b=tau_b, h_out=h_out, perfect_csi= perfect_csi)
         # Option2:
-        x_hat, no_eff, h_hat, err_var, h_perfect, err_var_perfect = self.channelest_equ(
-            y, no, h_b=h_b, tau_b=tau_b, h_out=h_out, perfect_csi=perfect_csi
-        )
+        # x_hat, no_eff, h_hat, err_var, h_perfect, err_var_perfect = self.channelest_equ(
+        #     y, no, h_b=h_b, tau_b=tau_b, h_out=h_out, perfect_csi=perfect_csi
+        # )
+
+        # adding nrx
+        # Load the model
+        x_hat, no_eff = process_signal(y, x, no, h_b, tau_b, h_out)
+
+        # Outputs:
+        # x_hat: The estimated transmitted signal.
+        # no_eff: The effective noise after processing.
+        # h_hat: The estimated channel response.
+        # err_var: The error variance.
+        # h_perfect: The perfect channel response (if applicable).
+        # err_var_perfect: The error variance for the perfect channel.
+
+        # demapper_Decision takes the estimated transmitted signal x_hat and the effective noise no_eff. It returns:
+        # b_hat: The estimated bits after demapping.
+        # llr_est: The log-likelihood ratios for the estimated bits.
         b_hat, llr_est = self.demapper_decision(x_hat=x_hat, no_eff=no_eff)
         BER = calculate_BER(b, b_hat)
         print("BER Value:", BER)
 
-        if self.savedata:
-            saved_data = self.save_parameters()
-            saved_data["no"] = no
-            saved_data["h_b"] = h_b
-            saved_data["tau_b"] = tau_b
-            saved_data["h_out"] = h_out
-            saved_data["y"] = y
-            saved_data["x_rg"] = x_rg
-            saved_data["x"] = x
-            saved_data["b"] = b
-            saved_data["x_hat"] = x_hat
-            saved_data["no_eff"] = no_eff
-            saved_data["h_hat"] = to_numpy(h_hat)
-            # saved_data['err_var']=to_numpy(err_var)
-            saved_data["err_var"] = err_var
-            saved_data["h_perfect"] = h_perfect
-            saved_data["err_var_perfect"] = err_var_perfect
-            saved_data["b_hat"] = b_hat
-            saved_data["llr_est"] = llr_est
-            saved_data["BER"] = BER
-            np.save(datapath, saved_data)
-            # np.load d2.item() to retrieve the actual dict object first:
+        # if self.savedata:
+        #     saved_data = self.save_parameters()
+        #     saved_data["no"] = no
+        #     saved_data["h_b"] = h_b
+        #     saved_data["tau_b"] = tau_b
+        #     saved_data["h_out"] = h_out
+        #     saved_data["y"] = y
+        #     saved_data["x_rg"] = x_rg
+        #     saved_data["x"] = x
+        #     saved_data["b"] = b
+        #     saved_data["x_hat"] = x_hat
+        #     saved_data["no_eff"] = no_eff
+        #     saved_data["h_hat"] = to_numpy(h_hat)
+        #     # saved_data['err_var']=to_numpy(err_var)
+        #     saved_data["err_var"] = err_var
+        #     saved_data["h_perfect"] = h_perfect
+        #     saved_data["err_var_perfect"] = err_var_perfect
+        #     saved_data["b_hat"] = b_hat
+        #     saved_data["llr_est"] = llr_est
+        #     saved_data["BER"] = BER
+        #     np.save(datapath, saved_data)
+        # np.load d2.item() to retrieve the actual dict object first:
         return b_hat, BER
 
     def save_parameters(self):
@@ -2351,6 +2413,7 @@ def sim_bersingle2(
     if not os.path.exists(datapathbase):
         os.makedirs(datapathbase)
 
+    # - Eb/N0 Values: This line generates 20 evenly spaced values between EBN0_DB_MIN and EBN0_DB_MAX. These values will be used in the simulation to evaluate the performance of the communication system at different noise levels.
     ebno_dbs = np.linspace(EBN0_DB_MIN, EBN0_DB_MAX, 20)
     scenario = "O1_60"
     datapath = datapathbase + channeldataset + "_" + channeltype
@@ -2374,26 +2437,33 @@ def sim_bersingle2(
         guards=True,
         showfig=showfigure,
         savedata=True,
-        outputpath=datapathbase,
+        outputpath=datapathbase,  # deepmimo_ofdm_
     )
 
-    b_hat, BER = eval_transceiver(
-        ebno_db=5.0, perfect_csi=False, datapath=datapath + "_ebno5.npy"
-    )
+    # b_hat, BER = eval_transceiver(
+    #     ebno_db=5.0,
+    #     perfect_csi=False,
+    #     datapath=datapath + "_ebno5.npy",  # deepmimo_ofdm_
+    # )
 
     # channeltype="perfect", "awgn", "ofdm", "time"
     # Number of information bits per codeword
+    # Here, k retrieves the number of information bits per codeword from the eval_transceiver
     k = eval_transceiver.k
     binary_source = BinarySource()
+    # Number of streams per transmitter
     NUM_STREAMS_PER_TX = eval_transceiver.num_streams_per_tx
     # Start Transmitter self.k Number of information bits per codeword
+
+    # Generate Random Bits: This generates random binary data for the specified batch size, number of transmitters, number of streams, and number of bits per codeword.
     b = binary_source(
         [BATCH_SIZE, 1, NUM_STREAMS_PER_TX, k]
     )  # [batch_size, num_tx, num_streams_per_tx, num_databits]
 
-    b_hat, BER = eval_transceiver(
-        ebno_db=25.0, perfect_csi=False, datapath=datapath + "_ebno25.npy"
-    )
+    # #  - Second Transmission: Similar to the previous transmission, this simulates the transmission with an Eb/N0 value of 25 dB and saves the results.
+    #     b_hat, BER = eval_transceiver(
+    #         ebno_db=25.0, perfect_csi=False, datapath=datapath + "_ebno25.npy"
+    #     )
 
     bers, blers, BERs = sim_ber(ebno_dbs, eval_transceiver, b, BATCH_SIZE)
     # ber_plot_single(ebno_dbs, bers, title = "BER Simulation", savefigpath='./data/bernew.jpg')
@@ -2455,34 +2525,34 @@ if __name__ == "__main__":
         datapathbase="data/",
     )
 
-    bers, blers, BERs = sim_bersingle2(
-        channeldataset="cdl",
-        channeltype="time",
-        NUM_BITS_PER_SYMBOL=2,
-        EBN0_DB_MIN=-5.0,
-        EBN0_DB_MAX=25.0,
-        BATCH_SIZE=32,
-        NUM_UT=1,
-        NUM_BS=1,
-        NUM_UT_ANT=2,
-        NUM_BS_ANT=16,
-        showfigure=showfigure,
-        datapathbase="data/",
-    )
-    bers, blers, BERs = sim_bersingle2(
-        channeldataset="deepmimo",
-        channeltype="time",
-        NUM_BITS_PER_SYMBOL=2,
-        EBN0_DB_MIN=-5.0,
-        EBN0_DB_MAX=25.0,
-        BATCH_SIZE=32,
-        NUM_UT=1,
-        NUM_BS=1,
-        NUM_UT_ANT=1,
-        NUM_BS_ANT=16,
-        showfigure=showfigure,
-        datapathbase="data/",
-    )
+    # bers, blers, BERs = sim_bersingle2(
+    #     channeldataset="cdl",
+    #     channeltype="time",
+    #     NUM_BITS_PER_SYMBOL=2,
+    #     EBN0_DB_MIN=-5.0,
+    #     EBN0_DB_MAX=25.0,
+    #     BATCH_SIZE=32,
+    #     NUM_UT=1,
+    #     NUM_BS=1,
+    #     NUM_UT_ANT=2,
+    #     NUM_BS_ANT=16,
+    #     showfigure=showfigure,
+    #     datapathbase="data/",
+    # )
+    # bers, blers, BERs = sim_bersingle2(
+    #     channeldataset="deepmimo",
+    #     channeltype="time",
+    #     NUM_BITS_PER_SYMBOL=2,
+    #     EBN0_DB_MIN=-5.0,
+    #     EBN0_DB_MAX=25.0,
+    #     BATCH_SIZE=32,
+    #     NUM_UT=1,
+    #     NUM_BS=1,
+    #     NUM_UT_ANT=1,
+    #     NUM_BS_ANT=16,
+    #     showfigure=showfigure,
+    #     datapathbase="data/",
+    # )
 
     if cdltest is True:
         test_CDLchannel()
